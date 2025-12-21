@@ -1,0 +1,541 @@
+from dataclasses import dataclass, field
+from typing import List, Dict, Optional, Tuple
+import math
+import numpy as np
+from scipy.sparse import csr_matrix
+from scipy.sparse.linalg import spsolve
+import threading
+from collections import defaultdict, deque
+
+# ==================== 异常定义 ====================
+
+class CircularDependencyError(Exception):
+    pass
+
+class InvalidSKUError(Exception):
+    pass
+
+# ==================== 数据模型 ====================
+
+@dataclass
+class PhysicalMetrics:
+    """物理成本的多维表示"""
+    labor_seconds: float = 0.0
+    entropy_j_k: float = 0.0
+    mass_kg: float = 0.0
+    
+    def __add__(self, other: 'PhysicalMetrics') -> 'PhysicalMetrics':
+        return PhysicalMetrics(
+            labor_seconds=self.labor_seconds + other.labor_seconds,
+            entropy_j_k=self.entropy_j_k + other.entropy_j_k,
+            mass_kg=self.mass_kg + other.mass_kg
+        )
+    
+    def __mul__(self, factor: float) -> 'PhysicalMetrics':
+        return PhysicalMetrics(
+            labor_seconds=self.labor_seconds * factor,
+            entropy_j_k=self.entropy_j_k * factor,
+            mass_kg=self.mass_kg * factor
+        )
+    
+    def to_dict(self) -> Dict:
+        return {
+            'labor_hours': self.labor_seconds / 3600,
+            'entropy': self.entropy_j_k,
+            'mass_kg': self.mass_kg
+        }
+
+@dataclass
+class BOMItem:
+    """物料清单子项"""
+    sku_id: str
+    qty: float
+    
+    def __post_init__(self):
+        if self.qty <= 0:
+            raise ValueError(f"BOM quantity must be positive, got {self.qty}")
+
+@dataclass
+class SKU:
+    """库存单元"""
+    id: str
+    name: str
+    direct_metrics: PhysicalMetrics
+    bom: List[BOMItem] = field(default_factory=list)
+    location: Tuple[float, float] = (0.0, 0.0)  # (lat, lon)
+    attributes: Dict[str, float] = field(default_factory=dict)
+    
+    def __post_init__(self):
+        lat, lon = self.location
+        if not (-90 <= lat <= 90):
+            raise ValueError(f"Invalid latitude: {lat}")
+        if not (-180 <= lon <= 180):
+            raise ValueError(f"Invalid longitude: {lon}")
+
+@dataclass
+class LPEWeights:
+    """物理量到LPE的转换权重"""
+    labor_hour_to_lpe: float = 10.0
+    entropy_jk_to_lpe: float = 1.0
+    transport_kg_km_to_lpe: float = 0.01
+    last_updated: str = "2025-01-01"
+    governance_record_url: str = ""
+
+# ==================== 核心计算引擎 ====================
+
+class LPECalculator:
+    def __init__(self, sku_db: Dict[str, SKU], weights: Optional[LPEWeights] = None):
+        self.db = sku_db
+        self.weights = weights or LPEWeights()
+        self._cache: Dict[str, PhysicalMetrics] = {}
+        self._cache_lock = threading.Lock()
+        self._local = threading.local()
+        self._dependency_order = self._topological_sort()
+    
+    def _get_recursion_stack(self) -> set:
+        if not hasattr(self._local, 'stack'):
+            self._local.stack = set()
+        return self._local.stack
+    
+    def _topological_sort(self) -> List[str]:
+        in_degree = defaultdict(int)
+        graph = defaultdict(list)
+        
+        for sku_id, sku in self.db.items():
+            if sku_id not in in_degree:
+                in_degree[sku_id] = 0
+            for item in sku.bom:
+                if item.sku_id not in self.db:
+                    raise InvalidSKUError(
+                        f"BOM references non-existent SKU: {item.sku_id}"
+                    )
+                graph[item.sku_id].append(sku_id)
+                in_degree[sku_id] += 1
+        
+        queue = deque([sku for sku in self.db if in_degree[sku] == 0])
+        sorted_order = []
+        
+        while queue:
+            node = queue.popleft()
+            sorted_order.append(node)
+            for neighbor in graph[node]:
+                in_degree[neighbor] -= 1
+                if in_degree[neighbor] == 0:
+                    queue.append(neighbor)
+        
+        if len(sorted_order) != len(self.db):
+            remaining = set(self.db.keys()) - set(sorted_order)
+            raise CircularDependencyError(
+                f"Circular dependency detected in SKUs: {remaining}"
+            )
+        
+        return sorted_order
+    
+    def calculate_all_intrinsic_costs(self) -> Dict[str, PhysicalMetrics]:
+        results = {}
+        for sku_id in self._dependency_order:
+            sku = self.db[sku_id]
+            total = sku.direct_metrics
+            for item in sku.bom:
+                total += results[item.sku_id] * item.qty
+            results[sku_id] = total
+        
+        with self._cache_lock:
+            self._cache.update(results)
+        return results
+    
+    def get_intrinsic_cost(self, sku_id: str) -> PhysicalMetrics:
+        if sku_id not in self.db:
+            raise InvalidSKUError(f"SKU not found: {sku_id}")
+        
+        with self._cache_lock:
+            if sku_id in self._cache:
+                return self._cache[sku_id]
+        
+        self.calculate_all_intrinsic_costs()
+        return self._cache[sku_id]
+    
+    def calculate_final_lpe(
+        self,
+        sku_id: str,
+        target_location: Tuple[float, float],
+        social_priorities: Dict[str, float],
+        scarcity_index: float = 1.0
+    ) -> Dict:
+        if sku_id not in self.db:
+            raise InvalidSKUError(f"SKU not found: {sku_id}")
+        
+        lat, lon = target_location
+        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+            raise ValueError(f"Invalid location: {target_location}")
+        
+        sku = self.db[sku_id]
+        intrinsic = self.get_intrinsic_cost(sku_id)
+        base_lpe = self._metrics_to_lpe(intrinsic)
+        
+        distance_km = self._haversine_distance(sku.location, target_location)
+        transport_lpe = (
+            distance_km * intrinsic.mass_kg * self.weights.transport_kg_km_to_lpe
+        )
+        
+        c_dynamic = self._calculate_social_multiplier(
+            sku, social_priorities, scarcity_index
+        )
+        
+        total_lpe = (base_lpe + transport_lpe) * (1 + c_dynamic)
+        
+        return {
+            'total_lpe': round(total_lpe, 4),
+            'breakdown': {
+                'base_physical_cost': round(base_lpe, 4),
+                'transport_cost': round(transport_lpe, 4),
+                'social_multiplier': round(c_dynamic, 4),
+            },
+            'physical_metrics': intrinsic.to_dict(),
+            'distance_km': round(distance_km, 2),
+        }
+    
+    def _metrics_to_lpe(self, metrics: PhysicalMetrics) -> float:
+        labor_lpe = (metrics.labor_seconds / 3600) * self.weights.labor_hour_to_lpe
+        entropy_lpe = metrics.entropy_j_k * self.weights.entropy_jk_to_lpe
+        return labor_lpe + entropy_lpe
+    
+    def _calculate_social_multiplier(
+        self,
+        sku: SKU,
+        social_priorities: Dict[str, float],
+        scarcity_index: float
+    ) -> float:
+        common_keys = set(sku.attributes.keys()) & set(social_priorities.keys())
+        if not common_keys:
+            priority_score = 0.0
+        else:
+            sku_vec = np.array([sku.attributes[k] for k in common_keys])
+            prio_vec = np.array([social_priorities[k] for k in common_keys])
+            sku_norm = np.linalg.norm(sku_vec)
+            prio_norm = np.linalg.norm(prio_vec)
+            if sku_norm > 0 and prio_norm > 0:
+                priority_score = np.dot(sku_vec, prio_vec) / (sku_norm * prio_norm)
+            else:
+                priority_score = 0.0
+        
+        scarcity_multiplier = math.log(max(scarcity_index, 0.1) + 1)
+        c_dynamic = 0.3 * priority_score + 0.7 * scarcity_multiplier
+        return max(-0.5, min(2.0, c_dynamic))
+    
+    @staticmethod
+    def _haversine_distance(coord1: Tuple[float, float], coord2: Tuple[float, float]) -> float:
+        lat1, lon1 = math.radians(coord1[0]), math.radians(coord1[1])
+        lat2, lon2 = math.radians(coord2[0]), math.radians(coord2[1])
+        dlat = lat2 - lat1
+        dlon = lon2 - lon1
+        a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
+        c = 2 * math.asin(math.sqrt(a))
+        return 6371 * c
+
+# ==================== 矩阵求解 (斯拉法模式) ====================
+
+class SraffianMatrixSolver:
+    def __init__(self, sku_db: Dict[str, SKU], weights: Optional[LPEWeights] = None):
+        self.db = sku_db
+        self.weights = weights or LPEWeights()
+        self.sku_list = list(sku_db.keys())
+        self.sku_to_idx = {sku_id: idx for idx, sku_id in enumerate(self.sku_list)}
+        self.n = len(self.sku_list)
+    
+    def build_technical_coefficient_matrix(self) -> np.ndarray:
+        A = np.zeros((self.n, self.n))
+        for j, sku_id in enumerate(self.sku_list):
+            sku = self.db[sku_id]
+            for bom_item in sku.bom:
+                i = self.sku_to_idx.get(bom_item.sku_id)
+                if i is not None:
+                    A[i, j] = bom_item.qty
+        return A
+    
+    def build_direct_input_vector(self, input_type: str = 'labor') -> np.ndarray:
+        direct_inputs = np.zeros(self.n)
+        for i, sku_id in enumerate(self.sku_list):
+            sku = self.db[sku_id]
+            if input_type == 'labor':
+                direct_inputs[i] = sku.direct_metrics.labor_seconds / 3600
+            elif input_type == 'entropy':
+                direct_inputs[i] = sku.direct_metrics.entropy_j_k
+            elif input_type == 'mass':
+                direct_inputs[i] = sku.direct_metrics.mass_kg
+            else:
+                raise ValueError(f"Unknown input type: {input_type}")
+        return direct_inputs
+    
+    def solve_total_requirements(
+        self,
+        final_demand: Optional[np.ndarray] = None
+    ) -> Dict[str, Dict[str, float]]:
+        A = self.build_technical_coefficient_matrix()
+        I = np.eye(self.n)
+        
+        try:
+            leontief_inverse = np.linalg.inv(I - A)
+        except np.linalg.LinAlgError:
+            raise ValueError(
+                "Matrix (I-A) is singular. The economy has circular dependencies "
+                "that cannot be resolved (Hawkins-Simon condition failed)."
+            )
+        
+        if final_demand is None:
+            final_demand = np.ones(self.n)
+        
+        total_output = leontief_inverse @ final_demand
+        
+        labor_direct = self.build_direct_input_vector('labor')
+        entropy_direct = self.build_direct_input_vector('entropy')
+        mass_direct = self.build_direct_input_vector('mass')
+        
+        total_labor = labor_direct @ total_output
+        total_entropy = entropy_direct @ total_output
+        total_mass = mass_direct @ total_output
+        
+        results = {}
+        for i, sku_id in enumerate(self.sku_list):
+            results[sku_id] = {
+                'gross_output': float(total_output[i]),
+                'final_demand': float(final_demand[i]),
+                'intermediate_use': float(total_output[i] - final_demand[i]),
+                'embodied_labor_hours': float(labor_direct[i] * total_output[i]),
+                'embodied_entropy': float(entropy_direct[i] * total_output[i]),
+                'embodied_mass': float(mass_direct[i] * total_output[i]),
+            }
+        
+        results['__SYSTEM_TOTAL__'] = {
+            'total_labor_hours': float(total_labor),
+            'total_entropy': float(total_entropy),
+            'total_mass': float(total_mass),
+            'total_output_value': float(np.sum(total_output)),
+        }
+        
+        return results
+    
+    def analyze_vertically_integrated_costs(self) -> Dict[str, PhysicalMetrics]:
+        A = self.build_technical_coefficient_matrix()
+        I = np.eye(self.n)
+        leontief_inverse = np.linalg.inv(I - A)
+        
+        labor_direct = self.build_direct_input_vector('labor')
+        entropy_direct = self.build_direct_input_vector('entropy')
+        mass_direct = self.build_direct_input_vector('mass')
+        
+        results = {}
+        for j, sku_id in enumerate(self.sku_list):
+            total_vector = leontief_inverse[:, j]
+            total_labor = np.dot(labor_direct, total_vector)
+            total_entropy = np.dot(entropy_direct, total_vector)
+            total_mass = np.dot(mass_direct, total_vector)
+            
+            results[sku_id] = PhysicalMetrics(
+                labor_seconds=total_labor * 3600,
+                entropy_j_k=total_entropy,
+                mass_kg=total_mass
+            )
+        
+        return results
+    
+    def detect_dominant_eigenvalue(self) -> Dict[str, float]:
+        A = self.build_technical_coefficient_matrix()
+        eigenvalues = np.linalg.eigvals(A)
+        max_eigenvalue = np.max(np.abs(eigenvalues))
+        
+        return {
+            'max_eigenvalue': float(max_eigenvalue),
+            'is_productive': bool(max_eigenvalue < 1),
+            'warning': (
+                "System is NOT productive (max eigenvalue >= 1). "
+                "Some production processes consume more than they produce."
+                if max_eigenvalue >= 1 else None
+            )
+        }
+
+# ==================== 示例使用 ====================
+
+def example_hospital_supplies():
+    print("SPCE/PRAIS 物理成本计算引擎 v2.0")
+    print("=" * 60)
+    print()
+    
+    sku_db = {
+        'cotton_raw': SKU(
+            id='cotton_raw',
+            name='原棉',
+            direct_metrics=PhysicalMetrics(
+                labor_seconds=1800,
+                entropy_j_k=5000,
+                mass_kg=1.0
+            ),
+            bom=[],
+            location=(30.0, 120.0),
+            attributes={'renewable': 1.0, 'local': 0.0}
+        ),
+        'gauze': SKU(
+            id='gauze',
+            name='医用纱布',
+            direct_metrics=PhysicalMetrics(
+                labor_seconds=3600,
+                entropy_j_k=2000,
+                mass_kg=0.1
+            ),
+            bom=[
+                BOMItem('cotton_raw', 0.15)
+            ],
+            location=(31.0, 121.0),
+            attributes={'medical_grade': 1.0, 'sterile': 1.0}
+        ),
+        'steel_raw': SKU(
+            id='steel_raw',
+            name='医用不锈钢',
+            direct_metrics=PhysicalMetrics(
+                labor_seconds=7200,
+                entropy_j_k=15000,
+                mass_kg=1.0
+            ),
+            bom=[],
+            location=(39.0, 117.0),
+            attributes={'recyclable': 1.0, 'durable': 1.0}
+        ),
+        'scalpel': SKU(
+            id='scalpel',
+            name='一次性手术刀',
+            direct_metrics=PhysicalMetrics(
+                labor_seconds=1800,
+                entropy_j_k=1000,
+                mass_kg=0.02
+            ),
+            bom=[
+                BOMItem('steel_raw', 0.025)
+            ],
+            location=(31.0, 121.0),
+            attributes={'precision': 1.0, 'disposable': 1.0}
+        ),
+    }
+    
+    weights = LPEWeights(
+        labor_hour_to_lpe=10.0,
+        entropy_jk_to_lpe=0.001,
+        transport_kg_km_to_lpe=0.01
+    )
+    
+    calculator = LPECalculator(sku_db, weights)
+    
+    print("=== 单品查询模式 ===")
+    target_location = (39.9, 116.4)
+    social_priorities = {
+        'medical_grade': 1.0,
+        'sterile': 0.8,
+        'renewable': 0.5
+    }
+    
+    gauze_lpe = calculator.calculate_final_lpe(
+        'gauze',
+        target_location,
+        social_priorities,
+        scarcity_index=1.2
+    )
+    
+    print(f"纱布 LPE: {gauze_lpe['total_lpe']}")
+    print(f"分解: {gauze_lpe['breakdown']}")
+    print(f"物理指标: {gauze_lpe['physical_metrics']}")
+    print()
+    
+    print("=== 矩阵求解模式 (Sraffian) ===")
+    matrix_solver = SraffianMatrixSolver(sku_db, weights)
+    
+    eigenvalue_analysis = matrix_solver.detect_dominant_eigenvalue()
+    print(f"特征值分析: {eigenvalue_analysis}")
+    print()
+    
+    integrated_costs = matrix_solver.analyze_vertically_integrated_costs()
+    print("垂直一体化成本:")
+    for sku_id, metrics in integrated_costs.items():
+        print(f"  {sku_id}: {metrics.to_dict()}")
+    print()
+    
+    final_demand = np.array([0, 100, 0, 50])
+    total_requirements = matrix_solver.solve_total_requirements(final_demand)
+    
+    print("全系统平衡:")
+    for sku_id, stats in total_requirements.items():
+        if sku_id != '__SYSTEM_TOTAL__':
+            print(f"  {sku_id}:")
+            print(f"    总产出: {stats['gross_output']:.2f}")
+            print(f"    最终需求: {stats['final_demand']:.2f}")
+            print(f"    中间消耗: {stats['intermediate_use']:.2f}")
+    
+    print("\n系统总计:")
+    system_total = total_requirements['__SYSTEM_TOTAL__']
+    print(f"  总劳动时间: {system_total['total_labor_hours']:.2f} 小时")
+    print(f"  总熵增: {system_total['total_entropy']:.2f} J/K")
+    print(f"  总质量: {system_total['total_mass']:.2f} kg")
+
+# ==================== 测试与验证 ====================
+
+def test_circular_dependency():
+    print("\n" + "=" * 60)
+    print("=== 测试: 环形依赖检测 ===")
+    
+    sku_db_with_cycle = {
+        'A': SKU(
+            id='A',
+            name='产品A',
+            direct_metrics=PhysicalMetrics(labor_seconds=3600),
+            bom=[BOMItem('B', 1.0)]
+        ),
+        'B': SKU(
+            id='B',
+            name='产品B',
+            direct_metrics=PhysicalMetrics(labor_seconds=3600),
+            bom=[BOMItem('A', 0.5)]
+        ),
+    }
+    
+    try:
+        calculator = LPECalculator(sku_db_with_cycle)
+        print("❌ 应该检测到环，但没有!")
+    except CircularDependencyError as e:
+        print(f"✅ 正确检测到环: {e}")
+
+def test_conservation():
+    print("\n=== 测试: 物理量守恒 ===")
+    
+    sku_db = {
+        'A': SKU(
+            id='A',
+            name='产品A',
+            direct_metrics=PhysicalMetrics(labor_seconds=3600, mass_kg=1.0),
+            bom=[]
+        ),
+        'B': SKU(
+            id='B',
+            name='产品B (由2个A组成)',
+            direct_metrics=PhysicalMetrics(labor_seconds=1800, mass_kg=0.1),
+            bom=[BOMItem('A', 2.0)]
+        ),
+    }
+    
+    calculator = LPECalculator(sku_db)
+    cost_A = calculator.get_intrinsic_cost('A')
+    cost_B = calculator.get_intrinsic_cost('B')
+    
+    print(f"产品A成本: {cost_A.to_dict()}")
+    print(f"产品B成本: {cost_B.to_dict()}")
+    
+    expected_mass_B = 0.1 + 2.0 * 1.0
+    print(f"\nB的质量 (实际): {cost_B.mass_kg:.2f} kg")
+    print(f"B的质量 (预期): {expected_mass_B:.2f} kg")
+    print(f"守恒性: {'✅ 通过' if abs(cost_B.mass_kg - expected_mass_B) < 0.01 else '❌ 失败'}")
+
+# ==================== 主函数 ====================
+
+if __name__ == '__main__':
+    example_hospital_supplies()
+    test_circular_dependency()
+    test_conservation()
+    print("\n" + "=" * 60)
+    print("测试完成!")
